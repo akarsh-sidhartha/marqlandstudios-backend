@@ -1,0 +1,349 @@
+'use strict';
+/**
+ * backend/services/aiService.js
+ *
+ * Central AI extraction service used by paymentTrackerRoutes, invoiceRoute,
+ * vendorRoutes (business card scan), and any future views.
+ *
+ * PROVIDER WATERFALL (tries in order, falls back on quota/error):
+ *   1. Gemini   — Best accuracy. Uses GEMINI_API_KEY. Free tier = 1500 req/day.
+ *   2. Mistral  — Good OCR. Uses MISTRAL_API_KEY. Free tier available.
+ *   3. Tesseract— Fully free, runs locally (no API key needed). Lower accuracy.
+ *
+ * USAGE:
+ *   const { extractFromDocument, extractFromBusinessCard, checkAIStatus } = require('./aiService');
+ *   const result = await extractFromDocument(base64Data, mimeType);
+ *   // result: { vendor_name, vendor_gst, invoice_number, date, total_amount,
+ *   //           cgst, sgst, igst, financialYear, month, _provider }
+ */
+
+const axios  = require('axios');
+const logger = require('../utils/logger').child({ module: 'aiService' });
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const parseAIJson = (text) => {
+  const clean = text.replace(/```json|```/g, '').trim();
+  return JSON.parse(clean);
+};
+
+// ── Gemini model list cache ───────────────────────────────────────────────────
+// Cached at module level — fetched once per process, not on every extraction call.
+// The original code called getGeminiModels inside the retry loop, making up to
+// 3 extra HTTP round-trips per document. Now fetched once and reused.
+let _cachedGeminiModels = null;
+
+const getGeminiModels = async (apiKey) => {
+  if (_cachedGeminiModels) return _cachedGeminiModels;
+  try {
+    const res = await axios.get(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
+      { timeout: 8_000 }
+    );
+    _cachedGeminiModels = res.data.models
+      .map(m => m.name.replace('models/', ''))
+      .filter(n => (n.includes('flash') || n.includes('pro')) && !n.includes('gemini-1.0'));
+    logger.debug('Gemini models cached', { models: _cachedGeminiModels });
+    return _cachedGeminiModels;
+  } catch (err) {
+    logger.warn('Failed to fetch Gemini model list — using fallback', { error: err.message });
+    return ['gemini-1.5-flash'];
+  }
+};
+
+// ── Provider 1: GEMINI ────────────────────────────────────────────────────────
+const callGemini = async (base64Data, mimeType, prompt) => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+
+  const payload = {
+    contents: [{
+      parts: [
+        { text: prompt },
+        { inlineData: { mimeType: mimeType || 'image/jpeg', data: base64Data } },
+      ],
+    }],
+  };
+
+  // Resolve model list once before the retry loop — avoids extra HTTP calls per attempt
+  const models = await getGeminiModels(apiKey);
+  const model  = Array.isArray(models) ? models[0] : models;
+  const url    = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  let attempts = 0;
+  while (attempts < 3) {
+    try {
+      const res  = await axios.post(url, payload, { timeout: 30_000 });
+      const text = res.data.candidates[0].content.parts[0].text;
+      return parseAIJson(text);
+    } catch (err) {
+      attempts++;
+      const status = err.response?.status;
+      if (status === 429) throw Object.assign(err, { isQuotaError: true });
+      if (attempts >= 3) throw err;
+      const delay = Math.pow(2, attempts) * 1_000;
+      logger.warn('Gemini attempt failed — retrying', { attempt: attempts, status, delay });
+      await sleep(delay);
+    }
+  }
+};
+
+// ── Provider 2: MISTRAL (pixtral-12b — vision model) ─────────────────────────
+const callMistral = async (base64Data, mimeType, prompt) => {
+  const apiKey = process.env.MISTRAL_API_KEY;
+  if (!apiKey) throw new Error('MISTRAL_API_KEY not set');
+
+  const imageUrl = base64Data.startsWith('data:')
+    ? base64Data
+    : `data:${mimeType || 'image/jpeg'};base64,${base64Data}`;
+
+  const res = await axios.post(
+    'https://api.mistral.ai/v1/chat/completions',
+    {
+      model:       'pixtral-12b-2409',
+      messages: [{
+        role:    'user',
+        content: [
+          { type: 'text',      text: prompt },
+          { type: 'image_url', image_url: { url: imageUrl } },
+        ],
+      }],
+      max_tokens:  800,
+      temperature: 0.1,
+    },
+    {
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      timeout: 40_000,
+    }
+  );
+
+  return parseAIJson(res.data.choices[0].message.content);
+};
+
+// ── Provider 3: TESSERACT (local OCR — no API key needed) ─────────────────────
+const callTesseract = async (base64Data) => {
+  let Tesseract;
+  try {
+    Tesseract = require('tesseract.js');
+  } catch {
+    throw new Error('tesseract.js not installed. Run: npm install tesseract.js');
+  }
+
+  const pureBase64 = base64Data.includes(',') ? base64Data.split(',')[1] : base64Data;
+  const buffer     = Buffer.from(pureBase64, 'base64');
+  const { data: { text } } = await Tesseract.recognize(buffer, 'eng', { logger: () => {} });
+  return extractFieldsFromRawText(text);
+};
+
+// ── Heuristic extraction from raw OCR text ────────────────────────────────────
+const extractFieldsFromRawText = (text) => {
+  const result = {
+    vendor_name:    null,
+    vendor_gst:     null,
+    invoice_number: null,
+    date:           null,
+    total_amount:   null,
+    cgst:           null,
+    sgst:           null,
+    igst:           null,
+    financialYear:  null,
+    month:          null,
+    _provider:      'tesseract',
+    _raw_text:      text,
+  };
+
+  const gstMatch = text.match(/\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}\b/);
+  if (gstMatch) result.vendor_gst = gstMatch[0];
+
+  const invMatch = text.match(/(?:invoice\s*(?:no|number|#)[:\s]+)([A-Z0-9\-\/]+)/i);
+  if (invMatch) result.invoice_number = invMatch[1].trim();
+
+  const dateMatch = text.match(/(\d{2})[\/\-](\d{2})[\/\-](\d{4})/);
+  if (dateMatch) {
+    const [, d, m, y] = dateMatch;
+    result.date  = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+    const mo     = parseInt(m);
+    result.month = new Date(`${y}-${m}-${d}`).toLocaleString('default', { month: 'long' });
+    result.financialYear = mo >= 4
+      ? `${y}-${String(parseInt(y) + 1).slice(-2)}`
+      : `${parseInt(y) - 1}-${String(y).slice(-2)}`;
+  }
+
+  const totalMatch = text.match(/(?:grand\s*total|total\s*amount|total)[:\s\u20B9Rs.]*([0-9,]+(?:\.\d{2})?)/i);
+  if (totalMatch) result.total_amount = parseFloat(totalMatch[1].replace(/,/g, ''));
+
+  const cgstMatch = text.match(/CGST[:\s\u20B9Rs.]*([0-9,]+(?:\.\d{2})?)/i);
+  const sgstMatch = text.match(/SGST[:\s\u20B9Rs.]*([0-9,]+(?:\.\d{2})?)/i);
+  const igstMatch = text.match(/IGST[:\s\u20B9Rs.]*([0-9,]+(?:\.\d{2})?)/i);
+  if (cgstMatch) result.cgst = parseFloat(cgstMatch[1].replace(/,/g, ''));
+  if (sgstMatch) result.sgst = parseFloat(sgstMatch[1].replace(/,/g, ''));
+  if (igstMatch) result.igst = parseFloat(igstMatch[1].replace(/,/g, ''));
+
+  const lines       = text.split('\n').map(l => l.trim()).filter(l => l.length > 3);
+  const companyLine = lines.find(l =>
+    /pvt|ltd|llp|inc|corp|industries|enterprise|trading|solutions|services/i.test(l)
+  );
+  if (companyLine) result.vendor_name = companyLine.replace(/[^a-zA-Z0-9\s&.,()-]/g, '').trim();
+
+  return result;
+};
+
+// ── Business card heuristics ──────────────────────────────────────────────────
+const extractCardFieldsFromText = (text) => ({
+  company_name: null,
+  name:         null,
+  phone:        text.match(/(?:\+91[\s-]?)?[6-9]\d{9}/)?.[0]   || null,
+  email:        text.match(/[\w.+-]+@[\w-]+\.[a-z]{2,}/i)?.[0] || null,
+  _provider:    'tesseract',
+  _raw_text:    text,
+});
+
+// ── Prompts ───────────────────────────────────────────────────────────────────
+const INVOICE_PROMPT = `Extract Indian Tax Invoice details from this document.
+Return ONLY a valid JSON object with these exact fields (use null for missing):
+{
+  "vendor_name": "string",
+  "vendor_gst": "15-char GSTIN string",
+  "invoice_number": "string",
+  "date": "YYYY-MM-DD",
+  "total_amount": number,
+  "cgst": number,
+  "sgst": number,
+  "igst": number,
+  "financialYear": "e.g. 2024-25",
+  "month": "full month name e.g. March"
+}
+No explanation. No markdown. Just the JSON object.`;
+
+const BUSINESS_CARD_PROMPT = `Extract contact details from this business card.
+Return ONLY a valid JSON object:
+{
+  "company_name": "string",
+  "name": "person's full name",
+  "phone": "phone number with country code",
+  "email": "email address"
+}
+No explanation. No markdown. Just the JSON object.`;
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PUBLIC API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const extractFromDocument = async (base64Data, mimeType) => {
+  const pureBase64 = base64Data.includes(',') ? base64Data.split(',')[1] : base64Data;
+  const errors     = [];
+
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const result = await callGemini(pureBase64, mimeType, INVOICE_PROMPT);
+      logger.debug('Document extracted via Gemini');
+      return { ...result, _provider: 'gemini' };
+    } catch (err) {
+      const reason = err.isQuotaError ? 'quota_exceeded' : err.message;
+      errors.push({ provider: 'gemini', reason });
+      logger.warn('Gemini extraction failed — trying Mistral', { reason });
+    }
+  } else {
+    errors.push({ provider: 'gemini', reason: 'no_key' });
+  }
+
+  if (process.env.MISTRAL_API_KEY) {
+    try {
+      const prompt = mimeType === 'application/pdf'
+        ? INVOICE_PROMPT + '\nNote: This may be a PDF rendered as image.'
+        : INVOICE_PROMPT;
+      const result = await callMistral(pureBase64, mimeType, prompt);
+      logger.debug('Document extracted via Mistral');
+      return { ...result, _provider: 'mistral' };
+    } catch (err) {
+      errors.push({ provider: 'mistral', reason: err.message });
+      logger.warn('Mistral extraction failed — trying Tesseract', { error: err.message });
+    }
+  } else {
+    errors.push({ provider: 'mistral', reason: 'no_key' });
+  }
+
+  try {
+    const result = await callTesseract(pureBase64);
+    logger.info('Document extracted via Tesseract (fallback)');
+    return result;
+  } catch (err) {
+    errors.push({ provider: 'tesseract', reason: err.message });
+  }
+
+  const summary = errors.map(e => `${e.provider}:${e.reason}`).join(', ');
+  logger.error('All AI providers failed for document extraction', { errors });
+  throw new Error(`All AI providers failed. Errors: ${summary}`);
+};
+
+const extractFromBusinessCard = async (base64Data) => {
+  const pureBase64 = base64Data.includes(',') ? base64Data.split(',')[1] : base64Data;
+  const mimeType   = 'image/jpeg';
+
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const result = await callGemini(pureBase64, mimeType, BUSINESS_CARD_PROMPT);
+      logger.debug('Business card extracted via Gemini');
+      return { ...result, _provider: 'gemini' };
+    } catch (err) {
+      logger.warn('Gemini card scan failed — trying Mistral', { error: err.message });
+    }
+  }
+
+  if (process.env.MISTRAL_API_KEY) {
+    try {
+      const result = await callMistral(pureBase64, mimeType, BUSINESS_CARD_PROMPT);
+      logger.debug('Business card extracted via Mistral');
+      return { ...result, _provider: 'mistral' };
+    } catch (err) {
+      logger.warn('Mistral card scan failed — trying Tesseract', { error: err.message });
+    }
+  }
+
+  try {
+    const { data: { text } } = await require('tesseract.js').recognize(
+      Buffer.from(pureBase64, 'base64'), 'eng', { logger: () => {} }
+    );
+    logger.info('Business card extracted via Tesseract (fallback)');
+    return extractCardFieldsFromText(text);
+  } catch (err) {
+    logger.error('All AI providers failed for business card', { error: err.message });
+    throw new Error('All AI providers failed for business card scan.');
+  }
+};
+
+const checkAIStatus = async () => {
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const models = await getGeminiModels(process.env.GEMINI_API_KEY);
+      const model  = Array.isArray(models) ? models[0] : models;
+      await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        { contents: [{ parts: [{ text: 'hi' }] }] },
+        { timeout: 5_000 }
+      );
+      return { available: true, provider: 'gemini', reason: 'ok' };
+    } catch (err) {
+      if (err.response?.status === 429) {
+        logger.info('Gemini quota exceeded — falling back to Mistral/Tesseract');
+        if (process.env.MISTRAL_API_KEY) return { available: true, provider: 'mistral', reason: 'gemini_quota_exceeded' };
+        return { available: true, provider: 'tesseract', reason: 'gemini_quota_exceeded' };
+      }
+    }
+  }
+
+  if (process.env.MISTRAL_API_KEY) {
+    return { available: true, provider: 'mistral', reason: 'gemini_unavailable' };
+  }
+
+  try {
+    require('tesseract.js');
+    return { available: true, provider: 'tesseract', reason: 'ai_apis_unavailable' };
+  } catch {
+    return { available: false, provider: 'none', reason: 'no_providers_available' };
+  }
+};
+
+module.exports = { extractFromDocument, extractFromBusinessCard, checkAIStatus };
